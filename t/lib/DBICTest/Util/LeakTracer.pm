@@ -6,8 +6,12 @@ use strict;
 use Carp;
 use Scalar::Util qw(isweak weaken blessed reftype);
 use DBIx::Class::_Util 'refcount';
+use DBIx::Class::Optional::Dependencies;
 use Data::Dumper::Concise;
 use DBICTest::Util 'stacktrace';
+use constant {
+  CV_tracing => DBIx::Class::Optional::Dependencies->req_ok_for ('test_leaktrace'),
+};
 
 use base 'Exporter';
 our @EXPORT_OK = qw(populate_weakregistry assert_empty_weakregistry hrefaddr);
@@ -95,8 +99,51 @@ sub CLONE {
   }
 }
 
+sub visit_refs {
+  my $args = { (ref $_[0]) ? %{$_[0]} : @_ };
+
+  $args->{seen_refs} ||= {};
+
+  for my $i (0 .. $#{$args->{refs}} ) {
+    my $r = $args->{refs}[$i];
+
+    next unless length ref $r;
+
+    next if $args->{seen_refs}{Scalar::Util::refaddr($r)}++;
+
+    next if isweak($args->{refs}[$i]);
+
+    $args->{action}->($r) or next;
+
+    my $type = reftype $r;
+    if ($type eq 'HASH') {
+      visit_refs({ %$args, refs => [ map {
+        ( !isweak($r->{$_}) ) ? $r->{$_} : ()
+      } keys %$r ] });
+    }
+    elsif ($type eq 'ARRAY') {
+      visit_refs({ %$args, refs => [ map {
+        ( !isweak($r->[$_]) ) ? $r->[$_] : ()
+      } 0..$#$r ] });
+    }
+    elsif ($type eq 'REF' and !isweak($$r)) {
+      visit_refs({ %$args, refs => [ $$r ] });
+    }
+    elsif (CV_tracing and $type eq 'CODE') {
+      visit_refs({ %$args, refs => [ map {
+        ( !isweak($_) ) ? $_ : ()
+      } PadWalker::closed_over($r) ] });
+    }
+  }
+}
+
 sub assert_empty_weakregistry {
   my ($weak_registry, $quiet) = @_;
+
+  # in case we hooked bless any extra object creation will wreak
+  # havoc during the assert phase
+  local *CORE::GLOBAL::bless;
+  *CORE::GLOBAL::bless = sub { CORE::bless( $_[0], (@_ > 1) ? $_[1] : caller() ) };
 
   croak 'Expecting a registry hashref' unless ref $weak_registry eq 'HASH';
 
@@ -116,57 +163,38 @@ sub assert_empty_weakregistry {
       if defined $weak_registry->{$addr}{weakref} and ! isweak( $weak_registry->{$addr}{weakref} );
   }
 
-  # compile a list of refs stored as CAG class data, so we can skip them
-  # intelligently below
-  my ($classdata_refcounts, $symwalker, $refwalker);
+  # compile a list of refs stored as globals (that would catch
+  # closures and class data), so we can skip them intelligently below
+  my $classdata_refs;
 
-  $refwalker = sub {
-    return unless length ref $_[0];
-
-    my $seen = $_[1] || {};
-    return if $seen->{hrefaddr $_[0]}++;
-
-    $classdata_refcounts->{hrefaddr $_[0]}++;
-
-    my $type = reftype $_[0];
-    if ($type eq 'HASH') {
-      $refwalker->($_, $seen) for values %{$_[0]};
-    }
-    elsif ($type eq 'ARRAY') {
-      $refwalker->($_, $seen) for @{$_[0]};
-    }
-    elsif ($type eq 'REF') {
-      $refwalker->($$_, $seen);
-    }
-  };
-
+  my $symwalker;
   $symwalker = sub {
     no strict 'refs';
     my $pkg = shift || '::';
 
-    $refwalker->(${"${pkg}$_"}) for grep { $_ =~ /__cag_(?!pkg_gen__|supers__)/ } keys %$pkg;
+    # any non-weak globals are "clasdata" in all possible sense
+    visit_refs (
+      action => sub { ++$classdata_refs->{hrefaddr $_[0]} },
+      refs => [ map { my $sym = $_;
+        # *{"$pkg$sym"}{CODE} won't simply work - MRO-cached CVs are invisible there
+        ( CV_tracing ? Class::MethodCache::get_cv("${pkg}$sym") : () ),
+
+        ( defined *{"$pkg$sym"}{SCALAR} and length ref ${"$pkg$sym"} and ! isweak( ${"$pkg$sym"} ) )
+          ? ${"$pkg$sym"} : ()
+        ,
+        ( map {
+          ( defined *{"$pkg$sym"}{$_} and ! isweak(defined *{"$pkg$sym"}{$_}) )
+              ? *{"$pkg$sym"}{$_} : ()
+        } qw(HASH ARRAY IO GLOB) )
+      } keys %$pkg ],
+    );
 
     $symwalker->("${pkg}$_") for grep { $_ =~ /(?<!^main)::$/ } keys %$pkg;
   };
 
-  # run things twice, some cycles will be broken, introducing new
-  # candidates for pseudo-GC
-  for (1,2) {
-    undef $classdata_refcounts;
+  $symwalker->();
 
-    $symwalker->();
-
-    for my $refaddr (keys %$weak_registry) {
-      if (
-        defined $weak_registry->{$refaddr}{weakref}
-          and
-        my $expected_refcnt = $classdata_refcounts->{$refaddr}
-      ) {
-        delete $weak_registry->{$refaddr}
-          if refcount($weak_registry->{$refaddr}{weakref}) == $expected_refcnt;
-      }
-    }
-  }
+  delete $weak_registry->{$_} for keys %$classdata_refs;
 
   for my $addr (sort { $weak_registry->{$a}{display_name} cmp $weak_registry->{$b}{display_name} } keys %$weak_registry) {
 
